@@ -16,7 +16,7 @@ class Config:
         self.res_x = 256   # Slab Thickness resolution
         self.res_y = 600   # Casting Length resolution
         self.dx = 0.002    # 2mm grid cell size
-        self.dt = 0.1    # Time step (Conservative for stability)
+        self.dt = 0.001    # Time step (Conservative for stability)
         
         # Steel Properties (Low Carbon Steel)
         self.rho = 7200.0       # Density kg/m3
@@ -157,18 +157,42 @@ class FluidSolver:
 
     @ti.kernel
     def apply_forces(self, f_l_field: ti.template()):
+        # Define the mechanical casting speed (The speed the rollers pull the slab)
+        v_cast = ti.Vector([0.0, -0.8]) # Matches your inlet speed roughly
+        
         for i, j in self.v:
             gravity = ti.Vector([0.0, -9.81])
             fl = f_l_field[i, j]
             
-            # Carman-Kozeny Drag (Stops flow in solid regions)
-            epsilon = 1e-4
-            drag = 0.0
-            if fl < 0.99:
-                 drag = -cfg.da_C * ((1.0 - fl)**2) / (fl**3 + epsilon)
+            # 1. Gravity always applies
+            force = gravity
             
-            # Apply forces
-            self.v[i, j] += (gravity + drag * self.v[i, j]) * cfg.dt
+            # 2. Solidification Drag (The Correction)
+            # Old Logic: Drag slows everything to 0.
+            # New Logic: Drag forces the solid to move at v_cast.
+            
+            # We use a blending method:
+            # If Liquid (fl=1): Physics is driven by Gravity + Pressure
+            # If Solid (fl=0): Physics is driven by the Motors (v_cast)
+            
+            current_v = self.v[i, j]
+            
+            # Relative velocity difference between fluid and the moving shell
+            v_relative = current_v - v_cast
+            
+            # Darcy Coefficient
+            epsilon = 1e-4
+            k_darcy = -cfg.da_C * ((1.0 - fl)**2) / (fl**3 + epsilon)
+            
+            # Apply drag relative to the casting speed
+            force += k_darcy * v_relative
+            
+            self.v[i, j] += force * cfg.dt
+
+            # HARD CONSTRAINT FOR SOLID (Optional but stable)
+            # If it's fully solid, force the speed exactly
+            if fl < 0.1:
+                 self.v[i, j] = v_cast
 
     @ti.kernel
     def compute_divergence(self):
@@ -211,14 +235,24 @@ class CasterSimulator:
         self.fluid = FluidSolver()
         self.initialize_field()
         
+    # @ti.kernel
+    # def initialize_field(self):
+    #     # Start with a dummy bar (cold)
+    #     for i, j in self.thermal.T:
+    #         self.thermal.T[i, j] = 300.0
+    #         self.thermal.H[i, j] = cfg.Cp * 300.0
+    #         self.thermal.f_l[i, j] = 0.0
+    #         self.fluid.v[i, j] = ti.Vector([0.0, 0.0])
+
     @ti.kernel
     def initialize_field(self):
-        # Start with a dummy bar (cold)
+        v_start = ti.Vector([0.0, -0.8]) 
         for i, j in self.thermal.T:
             self.thermal.T[i, j] = 300.0
             self.thermal.H[i, j] = cfg.Cp * 300.0
             self.thermal.f_l[i, j] = 0.0
-            self.fluid.v[i, j] = ti.Vector([0.0, 0.0])
+            # Start everything moving down!
+            self.fluid.v[i, j] = v_start
 
     @ti.kernel
     def apply_boundary_conditions(self):
@@ -265,6 +299,14 @@ class CasterSimulator:
                 T_R = self.thermal.T[cfg.res_x-1, j]
                 flux_R = h_coeff * (T_R - 300.0)
                 self.thermal.H[cfg.res_x-1, j] -= (flux_R * cfg.dt / (cfg.rho * cfg.dx))
+        
+        for x in range(cfg.res_x):
+            self.fluid.v[x, 0] = self.fluid.v[x, 1]
+            self.fluid.p[x, 0] = 0.0 # Zero pressure at outlet
+            # Prevent inflow at outlet
+            if self.fluid.v[x, 0].y > 0:
+                self.fluid.v[x, 0].y = 0
+        
 
     def step(self):
         # 1. Fluid
