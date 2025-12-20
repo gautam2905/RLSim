@@ -1,112 +1,185 @@
 import taichi as ti
+import numpy as np
 
+# Initialize Taichi (mapped to CUDA if available, else CPU)
 ti.init(arch=ti.gpu)
 
-N = 32
-dt = 1e-4
-dx = 1 / N
-rho = 4e1
-NF = 2 * N**2  # number of faces
-NV = (N + 1) ** 2  # number of vertices
-E, nu = 4e4, 0.2  # Young's modulus and Poisson's ratio
-mu, lam = E / 2 / (1 + nu), E * nu / (1 + nu) / (1 - 2 * nu)  # Lame parameters
-ball_pos, ball_radius = ti.Vector([0.5, 0.0]), 0.32
-gravity = ti.Vector([0, -40])
-damping = 12.5
+# --- Configuration & Constants ---
+RES_X, RES_Y = 400, 800  # Resolution mimicking the mold aspect ratio
+STEPS = 40               # Substeps per frame
+viscosity = 0.02         # Kinematic viscosity (nu)
+omega = 1.0 / (3.0 * viscosity + 0.5) # Relaxation parameter
 
-pos = ti.Vector.field(2, float, NV, needs_grad=True)
-vel = ti.Vector.field(2, float, NV)
-f2v = ti.Vector.field(3, int, NF)  # ids of three vertices of each face
-B = ti.Matrix.field(2, 2, float, NF)
-F = ti.Matrix.field(2, 2, float, NF, needs_grad=True)
-V = ti.field(float, NF)
-phi = ti.field(float, NF)  # potential energy of each face (Neo-Hookean)
-U = ti.field(float, (), needs_grad=True)  # total potential energy
+# LBM D2Q9 Constants
+w = ti.field(dtype=float, shape=9)
+e = ti.Vector.field(2, dtype=int, shape=9)
 
+# --- Fields ---
+# Distribution functions (f_old -> f_new for double buffering)
+f_old = ti.field(dtype=float, shape=(RES_X, RES_Y, 9))
+f_new = ti.field(dtype=float, shape=(RES_X, RES_Y, 9))
+
+# Macroscopic variables
+rho = ti.field(dtype=float, shape=(RES_X, RES_Y))
+vel = ti.Vector.field(2, dtype=float, shape=(RES_X, RES_Y))
+image = ti.Vector.field(3, dtype=float, shape=(RES_X, RES_Y))
+
+# Geometry Mask: 0 = Fluid, 1 = Solid (Walls/SEN), 2 = Inlet, 3 = Outlet
+mask = ti.field(dtype=int, shape=(RES_X, RES_Y))
+
+# --- Setup LBM Basis ---
+@ti.kernel
+def init_constants():
+    # Weights for D2Q9
+    w[0] = 4.0 / 9.0
+    for i in range(1, 5): w[i] = 1.0 / 9.0
+    for i in range(5, 9): w[i] = 1.0 / 36.0
+    
+    # Basis vectors
+    e[0] = [0, 0]
+    e[1], e[2], e[3], e[4] = [1, 0], [0, 1], [-1, 0], [0, -1]
+    e[5], e[6], e[7], e[8] = [1, 1], [-1, 1], [-1, -1], [1, -1]
+
+# --- Geometry Definition ---
+# Recreating the SEN and Mold from
+@ti.kernel
+def init_geometry():
+    SEN_WIDTH = 40
+    SEN_TIP_DEPTH = 300
+    PORT_HEIGHT = 40
+    
+    for i, j in mask:
+        # Default: Fluid
+        mask[i, j] = 0
+        
+        # 1. Outer Walls (Mold Faces)
+        if i < 5 or i > RES_X - 5 or j > RES_Y - 5:
+            mask[i, j] = 1 # Solid wall
+        
+        # 2. Bottom Outlet (Open boundary)
+        if j < 5:
+            mask[i, j] = 3 # Outlet
+
+        # 3. Submerged Entry Nozzle (SEN) Geometry
+        # The central pipe coming from top
+        if abs(i - RES_X // 2) < SEN_WIDTH // 2 and j > (RES_Y - SEN_TIP_DEPTH):
+            mask[i, j] = 1 # Solid SEN walls
+            
+            # The inner bore (Inlet)
+            if abs(i - RES_X // 2) < (SEN_WIDTH // 2 - 6):
+                mask[i, j] = 2 # Inlet fluid
+                
+            # The Side Ports - Critical for the "Jet" pattern
+            # We cut holes in the side of the SEN near the bottom
+            is_near_bottom = j < (RES_Y - SEN_TIP_DEPTH + PORT_HEIGHT + 10) and j > (RES_Y - SEN_TIP_DEPTH + 10)
+            if is_near_bottom and abs(i - RES_X // 2) < SEN_WIDTH // 2:
+                mask[i, j] = 0 # Fluid (The Port)
+        
+        # 4. The SEN "Cup" bottom (stops flow going straight down)
+        if abs(i - RES_X // 2) < SEN_WIDTH // 2 and j < (RES_Y - SEN_TIP_DEPTH + 10) and j > (RES_Y - SEN_TIP_DEPTH):
+             mask[i, j] = 1 # Solid Cup Bottom
+
+    # Initialize f with rest density
+    for i, j, k in f_old:
+        f_old[i, j, k] = w[k]
+        f_new[i, j, k] = w[k]
+
+# --- LBM Core ---
+@ti.kernel
+def collide_and_stream():
+    for i, j in ti.ndrange(RES_X, RES_Y):
+        # 1. Read macroscopic
+        current_f = ti.Vector([0.0]*9)
+        for k in range(9):
+            current_f[k] = f_old[i, j, k]
+        
+        local_rho = 0.0
+        local_vel = ti.Vector([0.0, 0.0])
+        
+        for k in range(9):
+            local_rho += current_f[k]
+            local_vel += current_f[k] * e[k]
+        
+        if local_rho > 0:
+            local_vel /= local_rho
+        
+        # Force inlet velocity at SEN top
+        if mask[i, j] == 2:
+            local_vel = ti.Vector([0.0, -0.35]) # Downward injection
+            local_rho = 1.0
+
+        # Equilibrium
+        u_sq = local_vel.norm_sqr()
+        for k in range(9):
+            eu = local_vel.dot(e[k])
+            f_eq = w[k] * local_rho * (1.0 + 3.0*eu + 4.5*eu**2 - 1.5*u_sq)
+            
+            # BGK Collision
+            current_f[k] = (1.0 - omega) * current_f[k] + omega * f_eq
+            
+        # Streaming (Push to neighbors in f_new)
+        if mask[i, j] != 1: # If not solid
+            for k in range(9):
+                ni, nj = i + e[k][0], j + e[k][1]
+                if 0 <= ni < RES_X and 0 <= nj < RES_Y:
+                    # Bounce-back handling for walls
+                    if mask[ni, nj] == 1:
+                        # Reverse direction index mapping for D2Q9
+                        # 0->0, 1->3, 2->4, 3->1, 4->2 ...
+                        inv_k = 0
+                        if k == 1: inv_k = 3
+                        elif k == 2: inv_k = 4
+                        elif k == 3: inv_k = 1
+                        elif k == 4: inv_k = 2
+                        elif k == 5: inv_k = 7
+                        elif k == 6: inv_k = 8
+                        elif k == 7: inv_k = 5
+                        elif k == 8: inv_k = 6
+                        
+                        # Streaming to solid bounces back to current cell
+                        f_new[i, j, inv_k] = current_f[k]
+                    else:
+                        # Stream to neighbor
+                        f_new[ni, nj, k] = current_f[k]
 
 @ti.kernel
-def update_U():
-    for i in range(NF):
-        ia, ib, ic = f2v[i]
-        a, b, c = pos[ia], pos[ib], pos[ic]
-        V[i] = abs((a - c).cross(b - c))
-        D_i = ti.Matrix.cols([a - c, b - c])
-        F[i] = D_i @ B[i]
-    for i in range(NF):
-        F_i = F[i]
-        log_J_i = ti.log(F_i.determinant())
-        phi_i = mu / 2 * ((F_i.transpose() @ F_i).trace() - 2)
-        phi_i -= mu * log_J_i
-        phi_i += lam / 2 * log_J_i**2
-        phi[i] = phi_i
-        U[None] += V[i] * phi_i
-
+def update_macro():
+    for i, j in ti.ndrange(RES_X, RES_Y):
+        local_rho = 0.0
+        local_vel = ti.Vector([0.0, 0.0])
+        for k in range(9):
+            local_rho += f_new[i, j, k]
+            local_vel += f_new[i, j, k] * e[k]
+            # Copy new to old for next step
+            f_old[i, j, k] = f_new[i, j, k]
+            
+        rho[i, j] = local_rho
+        if local_rho > 0:
+            vel[i, j] = local_vel / local_rho
 
 @ti.kernel
-def advance():
-    for i in range(NV):
-        acc = -pos.grad[i] / (rho * dx**2)
-        vel[i] += dt * (acc + gravity)
-        vel[i] *= ti.exp(-dt * damping)
-    for i in range(NV):
-        # ball boundary condition:
-        disp = pos[i] - ball_pos
-        disp2 = disp.norm_sqr()
-        if disp2 <= ball_radius**2:
-            NoV = vel[i].dot(disp)
-            if NoV < 0:
-                vel[i] -= NoV * disp / disp2
-        # rect boundary condition:
-        cond = (pos[i] < 0) & (vel[i] < 0) | (pos[i] > 1) & (vel[i] > 0)
-        for j in ti.static(range(pos.n)):
-            if cond[j]:
-                vel[i][j] = 0
-        pos[i] += dt * vel[i]
+def render():
+    for i, j in image:
+        if mask[i, j] == 1:
+            image[i, j] = [0.2, 0.2, 0.2] # Grey Walls
+        elif mask[i, j] == 2:
+            image[i, j] = [0.0, 0.5, 0.0] # Inlet Marker
+        else:
+            # Visualize Velocity Magnitude (mimicking Fig 6 in paper)
+            v = vel[i, j].norm()
+            # Heatmap: Blue (low) -> Red (High)
+            image[i, j] = ti.Vector([v * 4.0, v * 2.0, 1.0 - v * 4.0])
 
+# --- Main Loop ---
+init_constants()
+init_geometry()
+gui = ti.GUI("CC Mold Flow (Structure Recreation)", res=(RES_X, RES_Y))
 
-@ti.kernel
-def init_pos():
-    for i, j in ti.ndrange(N + 1, N + 1):
-        k = i * (N + 1) + j
-        pos[k] = ti.Vector([i, j]) / N * 0.25 + ti.Vector([0.45, 0.45])
-        vel[k] = ti.Vector([0, 0])
-    for i in range(NF):
-        ia, ib, ic = f2v[i]
-        a, b, c = pos[ia], pos[ib], pos[ic]
-        B_i_inv = ti.Matrix.cols([a - c, b - c])
-        B[i] = B_i_inv.inverse()
-
-
-@ti.kernel
-def init_mesh():
-    for i, j in ti.ndrange(N, N):
-        k = (i * N + j) * 2
-        a = i * (N + 1) + j
-        b = a + 1
-        c = a + N + 2
-        d = a + N + 1
-        f2v[k + 0] = [a, b, c]
-        f2v[k + 1] = [c, d, a]
-
-
-def main():
-    init_mesh()
-    init_pos()
-    gui = ti.GUI("FEM99")
-    while gui.running:
-        for e in gui.get_events():
-            if e.key == gui.ESCAPE:
-                gui.running = False
-            elif e.key == "r":
-                init_pos()
-        for i in range(30):
-            with ti.ad.Tape(loss=U):
-                update_U()
-            advance()
-        gui.circles(pos.to_numpy(), radius=2, color=0xFFAA33)
-        gui.circle(ball_pos, radius=ball_radius * 512, color=0x666666)
-        gui.show()
-
-
-if __name__ == "__main__":
-    main()
+while gui.running:
+    for _ in range(STEPS):
+        collide_and_stream()
+        update_macro()
+    
+    render()
+    gui.set_image(image)
+    gui.show()
