@@ -1,0 +1,128 @@
+/*---------------------------------------------------------------------------*| =========                 |                                                 |
+| \      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      snappyHexMeshDict;
+}
+
+// 1. MAIN SWITCHES
+castellatedMesh true;
+snap            true;
+addLayers       true;
+
+geometry
+{
+    mold_walls.stl { type triSurfaceMesh; name mold_walls; }
+    SEN.stl        { type triSurfaceMesh; name SEN; }
+    brass_plates.stl 
+    { 
+        type triSurfaceMesh; 
+        name brass_plates; 
+    }
+}
+
+castellatedMeshControls
+{
+    // --- MESHING LIMITS ---
+    maxGlobalCells 2000000;
+    maxLocalCells 1000000;  // <-- THIS WAS THE MISSING LINE
+    minRefinementCells 10;
+    maxLoadUnbalance 0.10;
+    nCellsBetweenLevels 3;
+
+    // --- FEATURES (Empty to match your current setup) ---
+    features
+    (
+    );
+
+    // --- SURFACE REFINEMENT ---
+    refinementSurfaces
+    {
+        mold_walls
+        {
+            level (2 3); 
+        }
+        SEN
+        {
+            level (3 4);
+        }
+        
+        brass_plates
+        {
+            level (3 3);
+            faceType zone;      
+            cellZone solidZone; 
+            cellZoneInside true;
+            insidePoint (0.045 -0.1 0.0); 
+        }
+    }
+
+    // --- REGIONS (Empty but required) ---
+    refinementRegions
+    {
+    }
+
+    resolveFeatureAngle 30;
+    
+    // Point inside the liquid part of the mold
+    locationInMesh (0 -0.1 0); 
+    allowFreeStandingZoneFaces true;
+}
+
+// 2. SNAPPING
+snapControls
+{
+    nSmoothPatch 3;
+    tolerance 2.0;
+    nSolveIter 30;
+    nRelaxIter 5;
+    nFeatureSnapIter 10;
+    implicitFeatureSnap false;
+    explicitFeatureSnap true;
+    multiRegionFeatureSnap false; 
+}
+
+// 3. LAYERS
+addLayersControls
+{
+    relativeSizes true;
+    
+    layers
+    {
+        mold_walls
+        {
+            nSurfaceLayers 3; 
+        }
+        SEN
+        {
+            nSurfaceLayers 2;
+        }
+    }
+
+    expansionRatio 1.1;
+    finalLayerThickness 0.5;
+    minThickness 0.1;
+    nGrow 0;
+    featureAngle 60;
+    slipFeatureAngle 30;
+    nRelaxIter 3;
+    nSmoothSurfaceNormals 1;
+    nSmoothNormals 3;
+    nSmoothThickness 10;
+    maxFaceThicknessRatio 0.5;
+    maxThicknessToMedialRatio 0.3;
+    minMedialAxisAngle 90;
+    nBufferCellsNoExtrude 0;
+    nLayerIter 50;
+}
+
+meshQualityControls
+{
+    #include "meshQualityDict"
+}
+
+mergeTolerance 1e-6;

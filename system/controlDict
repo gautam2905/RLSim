@@ -1,0 +1,34 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      controlDict;
+}
+
+application     pisoFoam; // This is a placeholder, we will change it later
+
+startFrom       startTime;
+startTime       0;
+
+stopAt          endTime;
+endTime         10; // The paper averages over 39 seconds [cite: 283]
+
+// The paper uses a very small time step of 5e-5 seconds 
+deltaT          0.00005; 
+
+writeControl    runTime;
+writeInterval   0.1; // Save data every 0.1 seconds (adjustable)
+
+purgeWrite      0;
+writeFormat     ascii;
+writePrecision  6;
+writeCompression off;
+timeFormat      general;
+timePrecision   6;
+
+runTimeModifiable true;

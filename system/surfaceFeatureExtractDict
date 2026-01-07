@@ -1,0 +1,42 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      surfaceFeatureExtractDict;
+}
+
+// List of STLs to extract edges from
+surfaces
+(
+    "mold_walls.stl"
+    {
+        extractionMethod    extractFromSurface;
+        extractFromSurfaceCoeffs
+        {
+            includedAngle   150;
+        }
+    }
+    
+    "SEN.stl"
+    {
+        extractionMethod    extractFromSurface;
+        extractFromSurfaceCoeffs
+        {
+            includedAngle   150;
+        }
+    }
+
+    "brass_plates.stl"
+    {
+        extractionMethod    extractFromSurface;
+        extractFromSurfaceCoeffs
+        {
+            includedAngle   150;
+        }
+    }
+);

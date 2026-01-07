@@ -1,0 +1,49 @@
+/*---------------------------------------------------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      blockMeshDict;
+}
+
+convertToMeters 0.001; // Geometry in mm, converting to meters
+
+vertices
+(
+    // We need 8 corners for the background box.
+    // Box size: -150 to 150 in X, -600 to 600 in Y, -50 to 50 in Z
+    (-150 -600 -50) // 0
+    ( 150 -600 -50) // 1
+    ( 150  600 -50) // 2
+    (-150  600 -50) // 3
+    (-150 -600  50) // 4
+    ( 150 -600  50) // 5
+    ( 150  600  50) // 6
+    (-150  600  50) // 7
+);
+
+blocks
+(
+    // Now we reference points 0 through 7, which actually exist
+    hex (0 1 2 3 4 5 6 7) (40 100 20) simpleGrading (1 1 1)
+);
+
+edges
+();
+
+boundary
+(
+    outerBox
+    {
+        type patch;
+        faces
+        (
+            (0 1 2 3) (4 5 6 7) (0 1 5 4)
+            (2 3 7 6) (0 3 7 4) (1 2 6 5)
+        );
+    }
+);
